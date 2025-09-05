@@ -116,6 +116,50 @@ async def tts_api_url(request: Request):
         )
 
 
+@app.post("/tts_fast", responses={
+    200: {"content": {"application/octet-stream": {}}},
+    500: {"content": {"application/json": {}}}
+})
+async def tts_api_fast(request: Request):
+    """
+    Fast TTS endpoint using batched inference for long texts.
+    Accepts optional parameters for tuning performance.
+    """
+    try:
+        data = await request.json()
+        text = data["text"]
+        audio_paths = data["audio_paths"]
+
+        # Optional parameters for performance tuning
+        seed = data.get("seed", 8)
+        max_tokens = data.get("max_text_tokens_per_sentence", 100)
+        bucket_size = data.get("sentences_bucket_max_size", 8)
+
+        global tts
+        sr, wav = await tts.infer_fast(
+            audio_prompt=audio_paths,
+            text=text,
+            seed=seed,
+            max_text_tokens_per_sentence=max_tokens,
+            sentences_bucket_max_size=bucket_size
+        )
+        
+        with io.BytesIO() as wav_buffer:
+            sf.write(wav_buffer, wav, sr, format='WAV')
+            wav_bytes = wav_buffer.getvalue()
+
+        return Response(content=wav_bytes, media_type="audio/wav")
+    
+    except Exception as ex:
+        tb_str = ''.join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(tb_str)
+            }
+        )
+
 @app.post("/tts", responses={
     200: {"content": {"application/octet-stream": {}}},
     500: {"content": {"application/json": {}}}

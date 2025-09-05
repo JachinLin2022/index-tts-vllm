@@ -1,0 +1,1 @@
+VLLM_USE_V1=0 python api_server.py --model_dir /workspace/index-tts-vllm/IndexTTS-1.5 --port 11996

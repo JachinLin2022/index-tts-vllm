@@ -273,7 +273,210 @@ class IndexTTS:
             wav_data = wav_data.numpy().T
             wav_data = trim_and_pad_silence(wav_data)
             return (sampling_rate, wav_data)
+    
+    def bucket_sentences(self, sentences, bucket_max_size=4):
+        """
+        Sentence data bucketing.
+        if ``bucket_max_size=1``, return all sentences in one bucket.
+        """
+        outputs: List[Dict] = []
+        for idx, sent in enumerate(sentences):
+            outputs.append({"idx": idx, "sent": sent, "len": len(sent)})
+       
+        if len(outputs) > bucket_max_size:
+            # split sentences into buckets by sentence length
+            buckets: List[List[Dict]] = []
+            factor = 1.5
+            last_bucket = None
+            last_bucket_sent_len_median = 0
+
+            for sent in sorted(outputs, key=lambda x: x["len"]):
+                current_sent_len = sent["len"]
+                if current_sent_len == 0:
+                    print(">> skip empty sentence")
+                    continue
+                if last_bucket is None \
+                        or current_sent_len >= int(last_bucket_sent_len_median * factor) \
+                        or len(last_bucket) >= bucket_max_size:
+                    # new bucket
+                    buckets.append([sent])
+                    last_bucket = buckets[-1]
+                    last_bucket_sent_len_median = current_sent_len
+                else:
+                    # current bucket can hold more sentences
+                    last_bucket.append(sent) # sorted
+                    mid = len(last_bucket) // 2
+                    last_bucket_sent_len_median = last_bucket[mid]["len"]
+            last_bucket=None
+            # merge all buckets with size 1
+            out_buckets: List[List[Dict]] = []
+            only_ones: List[Dict] = []
+            for b in buckets:
+                if len(b) == 1:
+                    only_ones.append(b[0])
+                else:
+                    out_buckets.append(b)
+            if len(only_ones) > 0:
+                if len(only_ones) > 0:
+                    out_buckets.extend([only_ones[i:i+bucket_max_size] for i in range(0, len(only_ones), bucket_max_size)])
+            return out_buckets
+        return [outputs]
+
+    def pad_tokens_cat(self, tokens: List[torch.Tensor], padding_value, padding_side="right"):
+        # Simplified padding helper for VLLM version
+        tokens = [t.squeeze(0) for t in tokens]
+        return pad_sequence(tokens, batch_first=True, padding_value=padding_value)
+    
+
+    async def infer_fast(self, audio_prompt: List[str], text: str, output_path=None, verbose=False, seed=None,
+                         max_text_tokens_per_sentence=100, sentences_bucket_max_size=8):
+        """
+        VLLM-optimized fast inference for long texts.
+        - Splits text into sentences.
+        - Buckets sentences by length.
+        - Runs autoregressive generation for ALL sentences in ONE single VLLM call.
+        - Runs latent refinement and vocoding in batches for maximum efficiency.
+
+        Args:
+            sentences_bucket_max_size (int): Controls the trade-off between batch size and padding efficiency.
+                                             Larger values are faster but use more VRAM. 8-16 is a good range.
+        """
+        print(">> start VLLM fast inference...")
+        start_time = time.perf_counter()
+
+        # 1. Prepare Speaker Conditioning Embedding (once per audio prompt)
+        auto_conditioning = []
+        for ap_ in audio_prompt:
+            audio, sr = torchaudio.load(ap_)
+            audio = torch.mean(audio, dim=0, keepdim=True)
+            if audio.shape[0] > 1:
+                audio = audio[0].unsqueeze(0)
+            audio = torchaudio.transforms.Resample(sr, 24000)(audio)
+            cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
+            auto_conditioning.append(cond_mel)
+
+        with torch.no_grad():
+            speech_conditioning_latent = []
+            for cond_mel in auto_conditioning:
+                speech_conditioning_latent_ = self.gpt.get_conditioning(
+                    cond_mel, torch.tensor([cond_mel.shape[-1]], device=self.device)
+                )
+                speech_conditioning_latent.append(speech_conditioning_latent_)
+            speech_conditioning_latent = torch.stack(speech_conditioning_latent).sum(dim=0)
+            speech_conditioning_latent = speech_conditioning_latent / len(auto_conditioning)
+
+        # 2. Text Processing: Split and Bucket Sentences
+        text_tokens_list = self.tokenizer.tokenize(text)
+        sentences = self.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=max_text_tokens_per_sentence)
         
+        all_sentence_buckets = self.bucket_sentences(sentences, bucket_max_size=sentences_bucket_max_size)
+        
+        # Flatten all sentences for a single VLLM batch call
+        all_sentences_flat = [item for bucket in all_sentence_buckets for item in bucket]
+        if not all_sentences_flat:
+            print(">> No sentences to process after filtering.")
+            return
+
+        all_text_tokens = [
+            torch.tensor(self.tokenizer.convert_tokens_to_ids(item["sent"]), dtype=torch.int32, device=self.device).unsqueeze(0)
+            for item in all_sentences_flat
+        ]
+        
+        if verbose:
+            print(f">> Processing {len(all_sentences_flat)} sentences in {len(all_sentence_buckets)} buckets.")
+
+        # 3. Autoregressive Generation: SINGLE BATCH CALL TO VLLM
+        m_start_time = time.perf_counter()
+        if seed is not None:
+            self.gpt.sampling_params.seed = int(seed)
+        else:
+            self.gpt.sampling_params.seed = None
+
+        with torch.no_grad():
+            # vLLM returns a list of (codes, initial_latent) for each sentence in the batch
+            vllm_outputs = await self.gpt.inference_speech(speech_conditioning_latent, all_text_tokens)
+        gpt_gen_time = time.perf_counter() - m_start_time
+
+        # Create a dictionary to map original index to result
+        results_dict = {item["idx"]: res for item, res in zip(all_sentences_flat, vllm_outputs)}
+
+        # 4. Latent Refinement (Second GPT Pass) - Batched per bucket
+        all_refined_latents = {}
+        gpt_forward_time = 0
+        with torch.no_grad():
+            for bucket in all_sentence_buckets:
+                batch_text_tokens_list = [
+                    torch.tensor(self.tokenizer.convert_tokens_to_ids(item["sent"]), dtype=torch.int32, device=self.device).unsqueeze(0)
+                    for item in bucket
+                ]
+                
+                # Get the generated codes for this batch from the results_dict
+                batch_codes_list = [torch.tensor(results_dict[item["idx"]][0], dtype=torch.long, device=self.device).unsqueeze(0) for item in bucket]
+
+                # Pad the tensors for batch processing
+                batch_text_tokens = self.pad_tokens_cat(batch_text_tokens_list, self.cfg.gpt.stop_text_token)
+                batch_codes = self.pad_tokens_cat(batch_codes_list, self.stop_mel_token)
+
+                batch_text_lengths = torch.tensor([t.shape[1] for t in batch_text_tokens_list], device=self.device)
+                batch_code_lengths = torch.tensor([c.shape[1] for c in batch_codes_list], device=self.device)
+
+                m_start_time = time.perf_counter()
+                # Run the second GPT pass on the whole batch
+                refined_latents = self.gpt(
+                    speech_conditioning_latent.expand(len(bucket), -1, -1),
+                    batch_text_tokens,
+                    batch_text_lengths,
+                    batch_codes,
+                    batch_code_lengths * self.gpt.mel_length_compression,
+                    cond_mel_lengths=torch.tensor([speech_conditioning_latent.shape[-1]], device=self.device).expand(len(bucket)),
+                    return_latent=True, clip_inputs=False
+                )
+                gpt_forward_time += time.perf_counter() - m_start_time
+                
+                # Store refined latents
+                for i, item in enumerate(bucket):
+                    # Unpad the latent to its original length
+                    original_len = batch_code_lengths[i]
+                    all_refined_latents[item["idx"]] = refined_latents[i, :original_len, :].unsqueeze(0)
+
+        # 5. Vocoder (BigVGAN) - Batched
+        # Reorder latents to match original sentence order and concatenate
+        ordered_latents = [all_refined_latents[i] for i in range(len(all_sentences_flat))]
+        full_latent = torch.cat(ordered_latents, dim=1)
+
+        m_start_time = time.perf_counter()
+        with torch.no_grad():
+            wav, _ = self.bigvgan(full_latent, [ap.transpose(1, 2) for ap in auto_conditioning])
+            wav = wav.squeeze(1)
+        bigvgan_time = time.perf_counter() - m_start_time
+        
+        wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+
+        # 6. Finalization
+        torch.cuda.empty_cache()
+        end_time = time.perf_counter()
+        
+        sampling_rate = 24000
+        wav_length = wav.shape[-1] / sampling_rate
+        print(f">> VLLM gpt_gen_time (autoregressive): {gpt_gen_time:.2f} seconds")
+        print(f">> gpt_forward_time (refinement): {gpt_forward_time:.2f} seconds")
+        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+        print(f">> Total fast inference time: {end_time - start_time:.2f} seconds")
+        print(f">> Generated audio length: {wav_length:.2f} seconds")
+        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+
+        wav = wav.cpu()
+        if output_path:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            print(">> wav file saved to:", output_path)
+            return output_path
+        else:
+            wav_data = wav.type(torch.int16).numpy().T
+            wav_data = trim_and_pad_silence(wav_data)
+            return (sampling_rate, wav_data)
+
+
     async def infer_with_ref_audio_embed(self, speaker: str, text):
         start_time = time.perf_counter()
         text = text.replace("嗯", "EN4")

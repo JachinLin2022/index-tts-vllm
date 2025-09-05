@@ -35,6 +35,7 @@ class TTSStressTester:
             # 生成随机数字符串，确保不触发 vllm 的 cache
             self.data["text"] = ",".join(["".join([str(random.randint(0, 9)) for _ in range(5)]) for _ in range(5)])
             target_url = self._get_next_url()  # 获取轮询后的URL
+            print(f"Sending request to {target_url}")
             response = requests.post(target_url, json=self.data, timeout=10)
             elapsed = time.time() - start_time
             
@@ -126,7 +127,8 @@ if __name__ == "__main__":
     
     test_data = {
         "text": args.text,
-        "character": args.character
+        # "character": args.character
+        "audio_paths": ["tests/sample_prompt.wav"]
     }
     
     tester = TTSStressTester(

@@ -159,35 +159,51 @@ class UnifiedVoice(nn.Module):
         return conds
 
     async def inference_speech(self, speech_conditioning_latent, text_inputs, cond_mel_lengths=None):
+        # This function now expects text_inputs to be a list of tensors.
+        
+        # We define an inner function to process a single request.
+        # VLLM's AsyncEngine will batch these concurrent requests internally.
+        async def _generate_one(text_input_tensor):
+            # 1. Pre-process one tensor, as the original function did
+            processed_text = F.pad(text_input_tensor, (0, 1), value=self.stop_text_token)
+            processed_text, _ = self.build_aligned_inputs_and_targets(processed_text, self.start_text_token, self.stop_text_token)
+            text_emb = self.text_embedding(processed_text) + self.text_pos_embedding(processed_text)
 
-        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
-        text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
-        text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+            # 2. Combine with the (shared) speech conditioning
+            emb = torch.cat([speech_conditioning_latent, text_emb], dim=1)
+            
+            mel_start_emb = self.mel_embedding(torch.full((emb.shape[0], 1,), fill_value=self.start_mel_token, dtype=torch.long, device=processed_text.device))
+            mel_start_emb = mel_start_emb + self.mel_pos_embedding(mel_start_emb)
+            inputs_embeds = torch.cat([emb, mel_start_emb], dim=1)
 
-        # speech_conditioning_latent = self.get_conditioning(speech_conditioning_latent, cond_mel_lengths)
-        emb = torch.cat([speech_conditioning_latent, text_emb], dim=1)
-        trunc_index = emb.shape[1] + 1
+            # 3. Create the prompt for VLLM
+            fake_inputs = [idx for idx in range(inputs_embeds.shape[1])]
+            multi_modal_data = {"image": inputs_embeds}
+            tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
+            
+            # 4. Generate the output
+            output_generator = self.llm.generate(tokens_prompt, self.sampling_params, request_id=str(uuid.uuid4()))
+            
+            final_output = None
+            async for output in output_generator:
+                final_output = output
+            
+            codes = final_output.outputs[0].token_ids[:-2]
+            
+            # For now, we don't return the latent from the first pass
+            return codes, None
 
-        mel_start_emb = self.mel_embedding(torch.full((emb.shape[0], 1,), fill_value=self.start_mel_token, dtype=torch.long, device=text_inputs.device))
-        mel_start_emb = mel_start_emb + self.mel_pos_embedding(mel_start_emb)
-        inputs_embeds = torch.cat([emb, mel_start_emb], dim=1)
-
-        fake_inputs = [idx for idx in range(inputs_embeds.shape[1])]
-        multi_modal_data = {"image": inputs_embeds}
-        tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
-        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=uuid.uuid4())
-        # latent = []
-        async for output in output_generator:
-            # latent.append(output.hidden_states.clone())
-            pass
-        codes = output.outputs[0].token_ids[:-2]
-
-        # latent = torch.cat(latent[:-2], dim=0).unsqueeze(0)
-        # # latent = self.final_norm(latent.float())
-        # latent = latent.float()
-        # print("codes", len(codes), codes)
-        # print("latent", latent.shape, latent)
-        return codes, None  # , latent
+        # Create a list of concurrent tasks
+        if isinstance(text_inputs, list):
+            # This is the path for infer_fast
+            tasks = [_generate_one(t) for t in text_inputs]
+            # Run all tasks concurrently and wait for them to complete
+            all_outputs = await asyncio.gather(*tasks)
+            return all_outputs
+        else:
+            # This is the original path for single-input inference (e.g., from infer)
+            # It still works as before.
+            return await _generate_one(text_inputs)
 
     def set_mel_padding(self, mel_input_tokens, mel_lengths):
         """
