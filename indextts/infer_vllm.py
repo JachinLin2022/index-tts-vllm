@@ -3,7 +3,7 @@ import re
 import time
 from subprocess import CalledProcessError
 import traceback
-from typing import List
+from typing import List, Dict
 
 import numpy as np
 import sentencepiece as spm
