@@ -205,6 +205,7 @@ class UnifiedVoice(nn.Module):
         gpt_config = GPT2Config(
             vocab_size=self.number_mel_codes,
             n_positions=self.max_mel_tokens + 2 + self.max_conditioning_inputs,
+            # n_positions=self.max_mel_tokens + self.max_text_tokens,
             n_ctx=seq_length,
             n_embd=self.model_dim,
             n_layer=self.layers,
@@ -215,6 +216,7 @@ class UnifiedVoice(nn.Module):
             bos_token_id=self.start_mel_token,
             eos_token_id=self.stop_mel_token,
         )
+        print(f">> gpt_config: {gpt_config}, max_mel_tokens: {self.max_mel_tokens}, max_conditioning_inputs: {self.max_conditioning_inputs}")
         self.inference_model = GPT2InferenceModel(
             gpt_config,
             self.gpt,

@@ -441,7 +441,6 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
 
             if is_pp_missing_parameter(name, self):
                 continue
-
             param = params_dict[name]
             # The HF's GPT-2 implementation uses Conv1D instead of Linear.
             # Because of this, we need to transpose the weights.

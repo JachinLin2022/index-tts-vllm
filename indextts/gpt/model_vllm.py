@@ -135,6 +135,7 @@ class UnifiedVoice(nn.Module):
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=4096,
             # enforce_eager=True,
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
@@ -158,12 +159,12 @@ class UnifiedVoice(nn.Module):
         conds = self.perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 32, d)
         return conds
 
-    async def inference_speech(self, speech_conditioning_latent, text_inputs, cond_mel_lengths=None):
+    async def inference_speech(self, speech_conditioning_latent, text_inputs, cond_mel_lengths=None, sampling_params=None):
         # This function now expects text_inputs to be a list of tensors.
         
         # We define an inner function to process a single request.
         # VLLM's AsyncEngine will batch these concurrent requests internally.
-        async def _generate_one(text_input_tensor):
+        async def _generate_one(text_input_tensor, sampling_params=None):
             # 1. Pre-process one tensor, as the original function did
             processed_text = F.pad(text_input_tensor, (0, 1), value=self.stop_text_token)
             processed_text, _ = self.build_aligned_inputs_and_targets(processed_text, self.start_text_token, self.stop_text_token)
@@ -182,11 +183,40 @@ class UnifiedVoice(nn.Module):
             tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
             
             # 4. Generate the output
-            output_generator = self.llm.generate(tokens_prompt, self.sampling_params, request_id=str(uuid.uuid4()))
+            if sampling_params is None:
+                sampling_params = self.sampling_params
+            print(f">> sampling_params: {sampling_params}")
+            output_generator = self.llm.generate(tokens_prompt, sampling_params, request_id=str(uuid.uuid4()))
             
             final_output = None
             async for output in output_generator:
                 final_output = output
+            
+            # 获取输入的 prompt 的 token 数量
+            num_prompt_tokens = len(final_output.prompt_token_ids)
+
+            # 获取生成的 completion output (通常是第一个)
+            completion_output = final_output.outputs[0]
+            all_generated_ids = completion_output.token_ids
+            # 获取新生成的 token 数量
+            num_generated_tokens = len(completion_output.token_ids)
+
+            print(f"Number of prompt tokens: {num_prompt_tokens}")
+            print(f"Number of generated tokens: {num_generated_tokens}")
+            print(f"Total tokens (prompt + generated): {num_prompt_tokens + num_generated_tokens}")
+
+            # 2. 打印最后几个 token，看看是不是停止符
+            if all_generated_ids:
+                print(f"--- VLLM Raw Output Diagnosis ---")
+                print(f"Last 5 generated tokens: {all_generated_ids[-5:]}")
+                last_token = all_generated_ids[-1]
+                print(f"The very last token is: {last_token}")
+                if last_token == self.stop_mel_token:
+                    print(f"SUCCESS: The last token ({last_token}) matches the stop token ({self.stop_mel_token}).")
+                else:
+                    print(f"WARNING: The last token ({last_token}) does NOT match the stop token ({self.stop_mel_token}).")
+            
+            # --- 诊断代码结束 ---
             
             codes = final_output.outputs[0].token_ids[:-2]
             
@@ -196,14 +226,14 @@ class UnifiedVoice(nn.Module):
         # Create a list of concurrent tasks
         if isinstance(text_inputs, list):
             # This is the path for infer_fast
-            tasks = [_generate_one(t) for t in text_inputs]
+            tasks = [_generate_one(t, sampling_params) for t in text_inputs]
             # Run all tasks concurrently and wait for them to complete
             all_outputs = await asyncio.gather(*tasks)
             return all_outputs
         else:
             # This is the original path for single-input inference (e.g., from infer)
             # It still works as before.
-            return await _generate_one(text_inputs)
+            return await _generate_one(text_inputs, sampling_params)
 
     def set_mel_padding(self, mel_input_tokens, mel_lengths):
         """

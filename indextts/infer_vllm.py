@@ -26,7 +26,7 @@ from indextts.utils.feature_extractors import MelSpectrogramFeatures
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
 import matplotlib.pyplot as plt
-
+from vllm import SamplingParams
 
 # def fade_in_out(wav, fade_in=int(24000*0.05), fade_out=int(24000*0.05)):
 #     wav = wav.astype(np.float32)
@@ -329,7 +329,7 @@ class IndexTTS:
     
 
     async def infer_fast(self, audio_prompt: List[str], text: str, output_path=None, verbose=False, seed=None,
-                         max_text_tokens_per_sentence=100, sentences_bucket_max_size=8):
+                         max_text_tokens_per_sentence=100, sentences_bucket_max_size=8, temperature=None, top_p=None, top_k=None, max_tokens=None, repetition_penalty=None):
         """
         VLLM-optimized fast inference for long texts.
         - Splits text into sentences.
@@ -391,10 +391,21 @@ class IndexTTS:
             self.gpt.sampling_params.seed = int(seed)
         else:
             self.gpt.sampling_params.seed = None
+            
+        sampling_params = SamplingParams(
+            temperature=temperature if temperature is not None else self.gpt.sampling_params.temperature,
+            top_p=top_p if top_p is not None else self.gpt.sampling_params.top_p,
+            top_k=top_k if top_k is not None else self.gpt.sampling_params.top_k,
+            max_tokens=max_tokens if max_tokens is not None else self.gpt.sampling_params.max_tokens,
+            repetition_penalty=repetition_penalty if repetition_penalty is not None else self.gpt.sampling_params.repetition_penalty,
+            seed=seed if seed is not None else self.gpt.sampling_params.seed,
+            # stop_token_ids=[self.stop_mel_token]
+            stop_token_ids=[]
+        )
 
         with torch.no_grad():
             # vLLM returns a list of (codes, initial_latent) for each sentence in the batch
-            vllm_outputs = await self.gpt.inference_speech(speech_conditioning_latent, all_text_tokens)
+            vllm_outputs = await self.gpt.inference_speech(speech_conditioning_latent, all_text_tokens, sampling_params=sampling_params)
         gpt_gen_time = time.perf_counter() - m_start_time
 
         # Create a dictionary to map original index to result

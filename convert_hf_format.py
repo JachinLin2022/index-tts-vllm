@@ -3,6 +3,7 @@ from omegaconf import OmegaConf
 from indextts.gpt.model import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 import argparse
+import torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_dir", type=str, default="")
@@ -32,5 +33,7 @@ model_path = os.path.join(vllm_save_dir, "model.safetensors")
 state_dict = load_file(model_path)
 
 # 打印所有参数名
-for key in state_dict.keys():
-    print(key)
+# for key in state_dict.keys():
+#     print(key)
+for n, p in state_dict.items():
+    print(n, p.shape)
